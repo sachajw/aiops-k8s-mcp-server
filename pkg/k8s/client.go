@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"log"
+	"os"
 	"sync"
 
 	"k8s.io/client-go/kubernetes"
@@ -19,10 +20,15 @@ var (
 func GetClient() *kubernetes.Clientset {
 	once.Do(func() {
 		// Load kubeconfig
+		kubeconfigPath := os.Getenv("KUBECONFIG")
+		if kubeconfigPath == "" {
+			kubeconfigPath = clientcmd.RecommendedHomeFile // Use default if not specified
+		}
+
 		var err error
-		restConfig, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+		restConfig, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 		if err != nil {
-			log.Fatalf("Failed to load kubeconfig: %v", err)
+			log.Fatalf("Failed to load kubeconfig from %s: %v", kubeconfigPath, err)
 		}
 
 		// Create Kubernetes client
@@ -33,12 +39,4 @@ func GetClient() *kubernetes.Clientset {
 	})
 
 	return clientset
-}
-
-// GetRESTConfig returns the REST config used to create the clientset
-func GetRESTConfig() *rest.Config {
-	if restConfig == nil {
-		log.Fatalf("REST config is not initialized. Call GetClient() first.")
-	}
-	return restConfig
 }
