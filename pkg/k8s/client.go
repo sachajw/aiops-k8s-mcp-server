@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -171,8 +172,15 @@ func (c *Client) ListResources(ctx context.Context, kind, namespace, labelSelect
 
 	var resources []map[string]interface{}
 	for _, item := range list.Items {
-		resources = append(resources, item.UnstructuredContent())
+		metadata := item.GetLabels()
+		resources = append(resources, map[string]interface{}{
+			"name":      item.GetName(),
+			"kind":      item.GetKind(),
+			"namespace": item.GetNamespace(),
+			"labels":    metadata,
+		})
 	}
+
 	return resources, nil
 }
 
@@ -570,42 +578,85 @@ func (c *Client) GetEvents(ctx context.Context, namespace string) ([]map[string]
 	return events, nil
 }
 
-// GetIngresses retrieves ingresses for a specific host and path.
+// GetIngresses retrieves ingresses and returns specific fields: name, namespace, hosts, paths, and backend services.
 // It uses the networking.k8s.io/v1 clientset to fetch ingresses.
-// Returns a slice of maps, each representing an ingress, or an error.
-func (c *Client) GetIngresses(ctx context.Context, host, path, namespace string) ([]map[string]interface{}, error) {
-	ingresses, err := c.clientset.NetworkingV1().Ingresses(namespace).List(ctx, metav1.ListOptions{})
+// Returns a slice of maps, each representing an ingress with the requested fields, or an error.
+func (c *Client) GetIngresses(ctx context.Context, host string) ([]map[string]interface{}, error) {
+	ingresses, err := c.clientset.NetworkingV1().Ingresses("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve ingresses: %w", err)
 	}
 
 	var ingressList []map[string]interface{}
 	for _, ingress := range ingresses.Items {
-		// Extract host and path information from rules
-		var hosts []string
-		var paths []string
+		// Check if this ingress has any rules matching the given host
+		hasMatchingHost := false
+		var matchingPaths []string
+		var matchingBackendServices []string
 
 		for _, rule := range ingress.Spec.Rules {
-			if rule.Host != "" {
-				hosts = append(hosts, rule.Host)
+			// If host filter is specified, only process rules matching the host
+			if host != "" && rule.Host != host {
+				continue
 			}
-			if rule.HTTP != nil {
-				for _, httpPath := range rule.HTTP.Paths {
-					if httpPath.Path != "" {
-						paths = append(paths, httpPath.Path)
+
+			// If we reach here, either no host filter or host matches
+			if host == "" || rule.Host == host {
+				hasMatchingHost = true
+
+				if rule.HTTP != nil {
+					for _, path := range rule.HTTP.Paths {
+						matchingPaths = append(matchingPaths, path.Path)
+
+						// Extract backend service information
+						if path.Backend.Service != nil {
+							matchingBackendServices = append(matchingBackendServices, path.Backend.Service.Name)
+						}
 					}
 				}
 			}
 		}
 
-		ingressList = append(ingressList, map[string]interface{}{
-			"name":      ingress.Name,
-			"namespace": ingress.Namespace,
-			"hosts":     hosts,
-			"paths":     paths,
-			"rules":     ingress.Spec.Rules,
-		})
+		// Only add this ingress if it has matching rules
+		if hasMatchingHost {
+			ingressList = append(ingressList, map[string]interface{}{
+				"name":            ingress.Name,
+				"namespace":       ingress.Namespace,
+				"paths":           matchingPaths,
+				"backendServices": matchingBackendServices,
+			})
+		}
 	}
 
 	return ingressList, nil
+}
+
+// RolloutRestart restarts any Kubernetes workload with a pod template (Deployment, DaemonSet, StatefulSet, etc.).
+// It patches the spec.template.metadata.annotations with the current timestamp.
+// Returns the patched resource content or an error if the resource doesn't support rollout restart.
+func (c *Client) RolloutRestart(ctx context.Context, kind, name, namespace string) (map[string]interface{}, error) {
+	gvr, err := c.getCachedGVR(kind)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get GVR for kind %s: %w", kind, err)
+	}
+
+	resource := c.dynamicClient.Resource(*gvr).Namespace(namespace)
+
+	patch := []byte(fmt.Sprintf(
+		`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`,
+		time.Now().Format(time.RFC3339),
+	))
+
+	result, err := resource.Patch(ctx, name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to rollout restart %s %s/%s: %w", kind, namespace, name, err)
+	}
+
+	content := result.UnstructuredContent()
+	spec, found, _ := unstructured.NestedMap(content, "spec", "template")
+	if !found || spec == nil {
+		return nil, fmt.Errorf("resource kind %s does not support rollout restart (no spec.template)", kind)
+	}
+
+	return content, nil
 }
